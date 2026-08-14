@@ -65,6 +65,21 @@ COLOR_EXPLOSION = (255, 200, 80)   # Explosion particles.
 COLOR_HUD_TEXT  = (230, 230, 230)  # Score / lives text.
 COLOR_HUD_DIM   = (140, 140, 160)  # Less important HUD text.
 
+# --- Neon / futuristic accents ----------------------------------------
+# Used by the redesigned Player and Boss draw() methods, plus the start
+# screen. Keeping them separate from the "gameplay" colors above makes
+# it easy to swap the whole neon palette without touching hitboxes/logic.
+NEON_CYAN     = (100, 240, 255)   # Player trim / glow.
+NEON_CYAN_DIM = (40, 120, 140)    # Player glow, outer/faint layer.
+NEON_MAGENTA  = (255, 60, 200)    # Boss trim / glow.
+NEON_MAGENTA_DIM = (140, 20, 110) # Boss glow, outer/faint layer.
+NEON_WHITE    = (235, 250, 255)   # Bright core highlights.
+
+# --- Start screen -------------------------------------------------------
+START_TITLE_TEXT  = "SKY STRIKER"
+START_PROMPT_TEXT = "Presiona ENTER para iniciar"
+START_BLINK_MS    = 500        # Half-period of the blink (on/off) in ms.
+
 # --- Star field (background) -----------------------------------------
 NUM_STARS = 80                # How many stars are visible at once.
                               # Lower this on slow machines.
@@ -128,6 +143,13 @@ ENEMY_TANK_HP = 4
 ENEMY_TANK_SCORE = 400
 ENEMY_TANK_FIRE_CHANCE = 0.008
 
+ENEMY_BOSS_SIZE = 80
+ENEMY_BOSS_SPEED = 1.4
+ENEMY_BOSS_HP = 10
+ENEMY_BOSS_SCORE = 500
+ENEMY_BOSS_FIRE_CHANCE = 0.003
+
+
 # Difficulty ramp: every DIFFICULTY_RAMP_SECONDS, spawn interval shrinks
 # by DIFFICULTY_RAMP_FACTOR (multiplicative). Set RAMP_FACTOR to 1.0 to
 # disable the ramp entirely.
@@ -164,6 +186,61 @@ def weighted_choice(options_with_weights):
     options = [pair[0] for pair in options_with_weights]
     weights = [pair[1] for pair in options_with_weights]
     return random.choices(options, weights=weights, k=1)[0]
+
+
+# ---------------------------------------------------------------------
+# Neon drawing helpers
+# ---------------------------------------------------------------------
+# pygame.draw has no built-in "glow"/blur. We fake one cheaply by
+# blitting a few translucent copies of a shape at increasing size onto a
+# temporary per-pixel-alpha surface, then blitting that once onto the
+# real screen with additive-ish blending. It's a handful of extra draw
+# calls per ship, which is trivial at this game's scale.
+def draw_glow_polygon(surface, points, glow_color, spread=3, layers=4, max_alpha=90):
+    """Draw a soft glow behind `points` (a polygon) using `glow_color`.
+
+    `points` are absolute screen coordinates. `spread` controls how far
+    the glow expands outward per layer (in pixels); `layers` controls
+    how many translucent rings are stacked; `max_alpha` is the alpha of
+    the innermost (brightest) layer, fading out toward the edge.
+    """
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    pad = spread * layers + 4
+    min_x, max_x = min(xs) - pad, max(xs) + pad
+    min_y, max_y = min(ys) - pad, max(ys) + pad
+    w, h = int(max_x - min_x), int(max_y - min_y)
+    if w <= 0 or h <= 0:
+        return
+
+    glow_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
+    local_points = [(px - min_x, py - min_y) for px, py in points]
+    local_cx, local_cy = cx - min_x, cy - min_y
+
+    # Draw from the outside in, so the brightest/smallest layer ends up
+    # on top with the least amount of alpha-blending overdraw.
+    for i in range(layers, 0, -1):
+        scale = 1.0 + (i * spread) / max(1.0, (max_x - min_x))
+        scaled = [
+            (local_cx + (px - local_cx) * scale, local_cy + (py - local_cy) * scale)
+            for px, py in local_points
+        ]
+        alpha = int(max_alpha * (1 - i / (layers + 1)))
+        color = (*glow_color[:3], alpha)
+        pygame.draw.polygon(glow_surf, color, scaled)
+
+    # BLEND_ADD makes overlapping translucent layers brighten like real
+    # neon light instead of just darkening/greying toward opaque.
+    surface.blit(glow_surf, (int(min_x), int(min_y)), special_flags=pygame.BLEND_RGBA_ADD)
+
+
+def draw_neon_line(surface, points, color, width=2, closed=False):
+    """A thin bright line on top of the glow, for crisp neon edges."""
+    if closed:
+        pygame.draw.polygon(surface, color, points, width)
+    else:
+        pygame.draw.lines(surface, color, False, points, width)
 
 
 # ---------------------------------------------------------------------
@@ -370,32 +447,74 @@ class Player:
         hw = PLAYER_WIDTH // 2
         hh = PLAYER_HEIGHT // 2
 
-        # Engine flame behind the ship — drawn first so it sits *under* the body.
-        # The flame jitters a few pixels each frame for an animated feel.
+        # ---- Engine glow (drawn first so it sits *under* the hull) -----
         flame_jitter = random.randint(-2, 2)
         flame_points = [
             (cx - 6, cy + hh - 2),
             (cx + 6, cy + hh - 2),
-            (cx,     cy + hh + 10 + flame_jitter),
+            (cx,     cy + hh + 12 + flame_jitter),
         ]
+        draw_glow_polygon(surface, flame_points, COLOR_PLAYER_THRUST,
+                           spread=4, layers=3, max_alpha=110)
         pygame.draw.polygon(surface, COLOR_PLAYER_THRUST, flame_points)
+        pygame.draw.polygon(surface, NEON_WHITE, [
+            (cx - 2, cy + hh - 2), (cx + 2, cy + hh - 2),
+            (cx, cy + hh + 5 + flame_jitter),
+        ])  # Bright inner flame core.
 
-        # The hull: a triangle pointing UP (since we shoot upward).
+        # ---- Hull: an angular, faceted fuselage instead of a plain -----
+        # ---- triangle — a narrow nose, a wider mid-body "collar", ------
+        # ---- and a swept-back tail.                                    -
         hull_points = [
-            (cx,         cy - hh),       # Nose
-            (cx - hw,    cy + hh - 4),   # Bottom-left
-            (cx + hw,    cy + hh - 4),   # Bottom-right
+            (cx,          cy - hh),        # Nose tip
+            (cx - 4,      cy - hh + 8),    # Nose shoulder (left)
+            (cx - hw + 2, cy + 2),         # Mid-body collar (left)
+            (cx - hw,     cy + hh - 4),    # Tail (left)
+            (cx,          cy + hh - 10),   # Tail notch (center)
+            (cx + hw,     cy + hh - 4),    # Tail (right)
+            (cx + hw - 2, cy + 2),         # Mid-body collar (right)
+            (cx + 4,      cy - hh + 8),    # Nose shoulder (right)
         ]
+        draw_glow_polygon(surface, hull_points, NEON_CYAN,
+                           spread=3, layers=4, max_alpha=80)
         pygame.draw.polygon(surface, COLOR_PLAYER, hull_points)
+        draw_neon_line(surface, hull_points, NEON_CYAN, width=2, closed=True)
 
-        # Wings: two small rectangles sticking out the sides.
-        pygame.draw.rect(surface, COLOR_PLAYER,
-                         (cx - hw - 4, cy + 2, 6, 10))
-        pygame.draw.rect(surface, COLOR_PLAYER,
-                         (cx + hw - 2, cy + 2, 6, 10))
+        # ---- Wings: angular, swept shapes instead of plain rectangles --
+        wing_left = [
+            (cx - hw + 2, cy + 2),
+            (cx - hw - 10, cy + hh - 2),
+            (cx - hw + 2, cy + hh - 2),
+            (cx - hw + 6, cy + 6),
+        ]
+        wing_right = [
+            (cx + hw - 2, cy + 2),
+            (cx + hw + 10, cy + hh - 2),
+            (cx + hw - 2, cy + hh - 2),
+            (cx + hw - 6, cy + 6),
+        ]
+        for wing in (wing_left, wing_right):
+            pygame.draw.polygon(surface, COLOR_PLAYER, wing)
+            draw_neon_line(surface, wing, NEON_CYAN_DIM, width=1, closed=True)
 
-        # Cockpit highlight: a small circle near the nose.
+        # Wingtip lights — tiny pulsing neon dots, offset in phase so
+        # left/right blink alternately (classic "running lights" feel).
+        pulse = (math.sin(pygame.time.get_ticks() * 0.01) + 1) / 2  # 0..1
+        tip_color = tuple(int(NEON_CYAN_DIM[i] + (NEON_CYAN[i] - NEON_CYAN_DIM[i]) * pulse)
+                           for i in range(3))
+        pygame.draw.circle(surface, tip_color, (cx - hw - 8, cy + hh - 3), 2)
+        pygame.draw.circle(surface, tip_color, (cx + hw + 8, cy + hh - 3), 2)
+
+        # ---- Neon spine line down the center of the hull ----------------
+        draw_neon_line(surface, [(cx, cy - hh + 6), (cx, cy + hh - 8)],
+                        NEON_CYAN, width=1)
+
+        # ---- Cockpit: glowing canopy instead of a flat highlight -------
+        draw_glow_polygon(surface, [
+            (cx - 3, cy - 6), (cx + 3, cy - 6), (cx + 2, cy + 3), (cx - 2, cy + 3),
+        ], NEON_CYAN, spread=2, layers=3, max_alpha=100)
         pygame.draw.circle(surface, COLOR_PLAYER_HI, (cx, cy - 2), 4)
+        pygame.draw.circle(surface, NEON_WHITE, (cx, cy - 3), 2)
 
 
 # ---------------------------------------------------------------------
@@ -511,6 +630,148 @@ class Enemy:
         pygame.draw.circle(surface, (30, 0, 30), (cx, cy - half + 8), 4)
 
 
+class Boss:
+    def __init__(self):
+        self.size = ENEMY_BOSS_SIZE
+        self.speed = ENEMY_BOSS_SPEED
+        self.hp = ENEMY_BOSS_HP
+        self.score = ENEMY_BOSS_SCORE
+        self.fire_chance = ENEMY_BOSS_FIRE_CHANCE
+        self.color = COLOR_ENEMY
+
+
+        # Spawn at a random horizontal position, just above the screen.
+        half = self.size / 2
+        self.x = random.uniform(half, SCREEN_WIDTH - half)
+        self.y = -half
+
+        # Light side-to-side wobble so enemies don't fly in straight lines.
+        # `wobble_phase` is just the starting angle of the sine wave.
+        self.wobble_phase = random.uniform(0, math.tau)
+        self.wobble_amount = random.uniform(0.5, 1.5)
+        # `age_frames` drives the wobble over time.
+        self.age_frames = 0
+
+        self.alive = True
+        self.rect = pygame.Rect(0, 0, self.size, self.size)
+        self.rect.center = (int(self.x), int(self.y))
+
+    def update(self, bullets):
+        # Move straight down + a little sideways sine-wave wobble.
+        self.age_frames += 1
+        self.y += self.speed
+        wobble_dx = math.sin(self.age_frames * 0.05 + self.wobble_phase)
+        self.x += wobble_dx * self.wobble_amount
+
+        # Stay on-screen horizontally (for tanks especially, the sprite is wide).
+        half = self.size / 2
+        if self.x < half:
+            self.x = half
+        if self.x > SCREEN_WIDTH - half:
+            self.x = SCREEN_WIDTH - half
+
+        self.rect.center = (int(self.x), int(self.y))
+
+        # If we've left the bottom, mark dead so the game removes us.
+        if self.y - half > SCREEN_HEIGHT:
+            self.alive = False
+            return
+
+        # Random chance to shoot. Only shoot once we're actually on-screen,
+        # so the player isn't surprised by bullets from invisible enemies.
+        if self.y > 0 and random.random() < self.fire_chance:
+            bullets.append(Bullet(
+                x=self.x,
+                y=self.y + half,
+                vy=ENEMY_BULLET_SPEED,   # Positive = moving DOWN.
+                color=COLOR_ENEMY_BULLET,
+                is_player_bullet=False,
+            ))
+
+    def take_damage(self, amount=1):
+        """Subtract HP and return True if the enemy just died."""
+        self.hp -= amount
+        if self.hp <= 0:
+            self.alive = False
+            return True
+        return False
+
+    def draw(self, surface):
+        cx, cy = int(self.x), int(self.y)
+        half = self.size // 2
+        now_ms = pygame.time.get_ticks()
+
+        # ---- Outer hull: a wide, faceted "warship prow" pointing down --
+        # instead of a simple triangle -- flatter shoulders and a jagged
+        # underside read as heavier armor plating.
+        body = [
+            (cx,             cy + half),        # Bottom point (prow)
+            (cx - half // 3, cy + half - 14),   # Prow shoulder (left)
+            (cx - half,      cy - half + 10),   # Top-left wingtip
+            (cx - half + 10, cy - half),        # Top-left shoulder
+            (cx + half - 10, cy - half),        # Top-right shoulder
+            (cx + half,      cy - half + 10),   # Top-right wingtip
+            (cx + half // 3, cy + half - 14),   # Prow shoulder (right)
+        ]
+        draw_glow_polygon(surface, body, NEON_MAGENTA,
+                           spread=4, layers=5, max_alpha=70)
+        pygame.draw.polygon(surface, self.color, body)
+        draw_neon_line(surface, body, NEON_MAGENTA, width=2, closed=True)
+
+        # ---- Armor ribs: parallel neon trim lines across the hull ------
+        for t in (0.35, 0.6, 0.8):
+            y = cy - half + int(self.size * t)
+            span = int(half * (1.0 - t * 0.6))
+            draw_neon_line(
+                surface,
+                [(cx - span, y), (cx + span, y - 4)],
+                NEON_MAGENTA_DIM, width=1,
+            )
+
+        # ---- Wing-mounted engine glows (pulse independently) -----------
+        pulse_a = (math.sin(now_ms * 0.006) + 1) / 2
+        pulse_b = (math.sin(now_ms * 0.006 + math.pi) + 1) / 2
+        for (ex, ey), pulse in (
+            ((cx - half + 6, cy - half + 14), pulse_a),
+            ((cx + half - 6, cy - half + 14), pulse_b),
+        ):
+            radius = 3 + int(2 * pulse)
+            glow_color = tuple(
+                int(NEON_MAGENTA_DIM[i] + (NEON_MAGENTA[i] - NEON_MAGENTA_DIM[i]) * pulse)
+                for i in range(3)
+            )
+            pygame.draw.circle(surface, glow_color, (ex, ey), radius + 3, width=1)
+            pygame.draw.circle(surface, glow_color, (ex, ey), radius)
+
+        # ---- Core "eye": a glowing, pulsing neon cockpit/reactor --------
+        core_pulse = (math.sin(now_ms * 0.008) + 1) / 2
+        core_radius = 5 + int(2 * core_pulse)
+        draw_glow_polygon(
+            surface,
+            [
+                (cx - core_radius, cy - half + 8 - core_radius),
+                (cx + core_radius, cy - half + 8 - core_radius),
+                (cx + core_radius, cy - half + 8 + core_radius),
+                (cx - core_radius, cy - half + 8 + core_radius),
+            ],
+            NEON_MAGENTA, spread=3, layers=4, max_alpha=110,
+        )
+        pygame.draw.circle(surface, (30, 0, 30), (cx, cy - half + 8), core_radius + 2)
+        pygame.draw.circle(surface, NEON_MAGENTA, (cx, cy - half + 8), core_radius, width=2)
+        pygame.draw.circle(surface, NEON_WHITE, (cx, cy - half + 8), max(1, core_radius - 3))
+
+        # ---- HP bar: thin neon health readout above the Boss ------------
+        # Purely cosmetic, but reinforces "this is a big, important target".
+        bar_w = self.size
+        bar_h = 5
+        bar_x = cx - bar_w // 2
+        bar_y = cy - half - 16
+        ratio = max(0.0, min(1.0, self.hp / ENEMY_BOSS_HP))
+        pygame.draw.rect(surface, (40, 10, 40), (bar_x, bar_y, bar_w, bar_h), border_radius=2)
+        pygame.draw.rect(surface, NEON_MAGENTA, (bar_x, bar_y, int(bar_w * ratio), bar_h), border_radius=2)
+        pygame.draw.rect(surface, NEON_MAGENTA_DIM, (bar_x, bar_y, bar_w, bar_h), width=1, border_radius=2)
+
+
 # ---------------------------------------------------------------------
 # Particle: a single dot in an explosion.
 # ---------------------------------------------------------------------
@@ -566,6 +827,7 @@ class Game:
     collisions happen?" -> `_handle_collisions`).
     """
     # State constants — using plain strings keeps them readable when printed.
+    STATE_START = "start"       # Title screen, before the run begins.
     STATE_PLAYING = "playing"
     STATE_PAUSED = "paused"
     STATE_GAME_OVER = "game_over"
@@ -575,6 +837,11 @@ class Game:
         self.font_big = font_big
         self.font_small = font_small
         self.reset()
+        # Begin on the title screen rather than dropping straight into
+        # gameplay -- reset() above still sets up a full, ready-to-play
+        # world (stars, player, spawner timers), we just don't let
+        # update() advance it until the player presses ENTER.
+        self.state = Game.STATE_START
 
     def reset(self):
         """Start (or restart) a fresh game."""
@@ -586,6 +853,7 @@ class Game:
         self.enemy_bullets = []
         self.enemies = []
         self.particles = []
+        self._boss_spawned = False
 
         self.stars = [Star() for _ in range(NUM_STARS)]
 
@@ -633,6 +901,10 @@ class Game:
     # -----------------------------------------------------------------
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
+            # Start screen -> gameplay
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.state == Game.STATE_START:
+                self.state = Game.STATE_PLAYING
+                self.start_ms = pygame.time.get_ticks()  # Restart the HUD hint timer too.
             # Pause toggling
             if event.key == pygame.K_p and self.state == Game.STATE_PLAYING:
                 self.state = Game.STATE_PAUSED
@@ -653,6 +925,13 @@ class Game:
     # Per-frame update
     # -----------------------------------------------------------------
     def update(self):
+        if self.state == Game.STATE_START:
+            # Keep the starfield drifting behind the title text so the
+            # title screen doesn't feel like a frozen, static image.
+            for star in self.stars:
+                star.update()
+            return
+
         if self.state != Game.STATE_PLAYING:
             return  # Pause and game-over freeze the world.
 
@@ -711,6 +990,16 @@ class Game:
                     died = enemy.take_damage(1)
                     if died:
                         self.score += enemy.score
+                        if self.score >= 1000 and not self._boss_spawned:
+                            # NOTE: this replaces the original `Boss(self)`
+                            # call, which built a Boss but never added it to
+                            # `self.enemies` (so it was never drawn/updated)
+                            # and passed an argument the constructor didn't
+                            # accept. `_boss_spawned` stops it from spawning
+                            # a fresh Boss on every kill once the threshold
+                            # is passed.
+                            self.enemies.append(Boss())
+                            self._boss_spawned = True
                         self._spawn_explosion(enemy.x, enemy.y)
                     break  # One bullet, one hit.
 
@@ -744,6 +1033,13 @@ class Game:
         for star in self.stars:
             star.draw(self.screen)
 
+        if self.state == Game.STATE_START:
+            # Title screen: background + drifting stars are already
+            # drawn above; layer the logo/prompt on top and stop --
+            # no player, enemies, or HUD exist meaningfully yet.
+            self._draw_start_screen()
+            return
+
         for e in self.enemies:
             e.draw(self.screen)
 
@@ -769,6 +1065,74 @@ class Game:
                 "GAME OVER",
                 f"Final score: {self.score}    Press R to restart",
             )
+
+    def _draw_start_screen(self):
+        """Title screen shown before STATE_PLAYING begins.
+
+        Reuses the same starfield background as gameplay so the game
+        doesn't feel like two disconnected apps stitched together, then
+        layers a glowing title, a small preview of the player ship, and
+        a blinking "press ENTER" prompt on top.
+        """
+        now_ms = pygame.time.get_ticks()
+
+        # Dark veil so text stays readable over busy stars, same trick
+        # used by _draw_center_message for pause/game-over overlays.
+        veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 90))
+        self.screen.blit(veil, (0, 0))
+
+        # --- Title, with a soft neon glow behind the text -----------------
+        title_surf = self.font_big.render(START_TITLE_TEXT, True, NEON_WHITE)
+        title_x = SCREEN_WIDTH // 2 - title_surf.get_width() // 2
+        title_y = SCREEN_HEIGHT // 3 - title_surf.get_height() // 2
+
+        glow_surf = self.font_big.render(START_TITLE_TEXT, True, NEON_CYAN)
+        glow_surf.set_alpha(70)
+        for ox, oy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
+            self.screen.blit(glow_surf, (title_x + ox, title_y + oy))
+        self.screen.blit(title_surf, (title_x, title_y))
+
+        # --- A small preview of the redesigned ship, hovering with a ------
+        # gentle bob so the title screen feels alive.
+        preview_x = SCREEN_WIDTH // 2
+        preview_y = title_y + title_surf.get_height() + 70
+        preview_y += int(6 * math.sin(now_ms * 0.003))
+        # Player.draw() reads position from the instance itself, so we
+        # temporarily move the real player here, draw it, then put it back
+        # -- avoids needing a second throwaway Player just for the preview.
+        # We also zero out its spawn invulnerability window so the preview
+        # doesn't flicker/blink (Player.draw skips drawing every other
+        # ~80ms while invulnerable) -- that flicker is meant to read as
+        # "just respawned", which is a confusing thing for a title screen
+        # to imply.
+        original_x, original_y = self.player.x, self.player.y
+        original_invuln_until = self.player.invuln_until_ms
+        self.player.x, self.player.y = preview_x, preview_y
+        self.player.invuln_until_ms = 0
+        self.player.draw(self.screen, now_ms)
+        self.player.x, self.player.y = original_x, original_y
+        self.player.invuln_until_ms = original_invuln_until
+
+        # --- Blinking "press ENTER" prompt --------------------------------
+        if (now_ms // START_BLINK_MS) % 2 == 0:
+            prompt_surf = self.font_small.render(START_PROMPT_TEXT, True, NEON_CYAN)
+            self.screen.blit(
+                prompt_surf,
+                (SCREEN_WIDTH // 2 - prompt_surf.get_width() // 2,
+                 preview_y + 60),
+            )
+
+        # --- Tiny control reminder at the bottom, always visible ----------
+        hint_surf = self.font_small.render(
+            "Move: arrows/WASD   Shoot: Space/Z", True, COLOR_HUD_DIM,
+        )
+        self.screen.blit(
+            hint_surf,
+            (SCREEN_WIDTH // 2 - hint_surf.get_width() // 2,
+             SCREEN_HEIGHT - HUD_MARGIN - hint_surf.get_height()),
+        )
+
 
     def _draw_background(self):
         # A very simple top-to-bottom gradient using horizontal lines.
@@ -816,6 +1180,8 @@ class Game:
                 hint,
                 (HUD_MARGIN, SCREEN_HEIGHT - HUD_MARGIN - hint.get_height()),
             )
+
+
 
     def _draw_center_message(self, big_text, small_text):
         # Translucent dark veil makes overlay text readable.
