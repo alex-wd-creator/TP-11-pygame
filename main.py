@@ -52,6 +52,12 @@ WINDOW_TITLE = "Sky Striker"  # Text in the window's title bar.
 # Change these to recolor the entire game.
 COLOR_BG_TOP    = (5, 5, 30)       # Sky color at the top of the screen.
 COLOR_BG_BOTTOM = (20, 0, 50)      # Sky color at the bottom (gradient).
+# COLOR_BG_TOP / COLOR_BG_BOTTOM are reassigned at runtime (via `global`)
+# when the player defeats a Boss, to simulate a level transition without
+# a full scene/state-machine rewrite. We snapshot the originals here so
+# Game.reset() can restore the level-1 sky when starting a new game.
+_ORIGINAL_COLOR_BG_TOP = COLOR_BG_TOP
+_ORIGINAL_COLOR_BG_BOTTOM = COLOR_BG_BOTTOM
 COLOR_STAR      = (255, 255, 255)  # Color of the scrolling star field.
 COLOR_PLAYER    = (90, 200, 255)   # Player ship body.
 COLOR_PLAYER_HI = (220, 240, 255)  # Player ship cockpit highlight.
@@ -164,6 +170,42 @@ ENEMY_BOSS_SPEED = 1.4
 ENEMY_BOSS_HP = 80
 ENEMY_BOSS_SCORE = 500
 ENEMY_BOSS_FIRE_CHANCE = 0.003
+# Unlike regular enemies, the Boss shouldn't just fly past and off the
+# bottom of the screen — it descends to this Y and then hovers there,
+# wobbling side to side, so the fight actually has time to happen.
+ENEMY_BOSS_HOVER_Y = 110
+
+# --- Power-ups ----------------------------------------------------------
+# Dropped by regular enemies (never the Boss — its reward is the
+# permanent buff below) and picked up by flying into them. Effects are
+# temporary and timed with pygame.time.get_ticks(), same pattern as the
+# player's invulnerability window.
+POWERUP_DROP_CHANCE = 0.22     # Chance a killed regular enemy drops one.
+POWERUP_SIZE = 20
+POWERUP_FALL_SPEED = 2.0
+POWERUP_DURATION_MS = 5000     # How long an active effect lasts.
+POWERUP_KIND_DOUBLE_SHOT = "double_shot"
+POWERUP_KIND_RAPID_FIRE = "rapid_fire"
+POWERUP_KINDS = (POWERUP_KIND_DOUBLE_SHOT, POWERUP_KIND_RAPID_FIRE)
+COLOR_POWERUP_DOUBLE_SHOT = (90, 230, 150)   # Green.
+COLOR_POWERUP_RAPID_FIRE  = (255, 205, 70)   # Amber.
+PLAYER_RAPID_FIRE_COOLDOWN_MS = 70  # Replaces PLAYER_FIRE_COOLDOWN_MS
+                                     # while rapid_fire is active.
+PLAYER_DOUBLE_SHOT_OFFSET = 9       # Horizontal gap between the two
+                                     # bullets fired during double_shot.
+
+# --- Boss reward: permanent speed upgrade -------------------------------
+# Granted once per Boss kill, stacks additively, and is completely
+# independent from the temporary power-ups above (it lives on the Player
+# as a separate attribute, so both systems can be active at once).
+BOSS_PERMANENT_SPEED_BONUS = 1.2
+
+# --- Level 2 palette ------------------------------------------------------
+# Swapped into the (normally constant) COLOR_BG_TOP / COLOR_BG_BOTTOM
+# globals when the Boss dies, so the sky itself signals "new level"
+# without needing a scene/state-machine rewrite.
+LEVEL_2_COLOR_BG_TOP = (5, 25, 10)     # Sky color at the top, level 2.
+LEVEL_2_COLOR_BG_BOTTOM = (0, 45, 15)  # Sky color at the bottom, level 2.
 
 
 # Difficulty ramp: every DIFFICULTY_RAMP_SECONDS, spawn interval shrinks
@@ -405,6 +447,20 @@ class Player:
         # brief "can't refire instantly" window even while ammo remains.
         self.special_ammo = PLAYER_SPECIAL_START_AMMO
         self.last_special_time_ms = -PLAYER_SPECIAL_COOLDOWN_MS
+
+        # Permanent, stacking speed bonus granted by defeating a Boss.
+        # Deliberately separate from PLAYER_SPEED itself so it survives
+        # across resets-of-nothing (it only resets with a full new Player,
+        # i.e. a brand new game) and stacks additively each time a Boss
+        # falls, independent of whatever temporary power-up is active.
+        self.permanent_speed_bonus = 0.0
+
+        # Temporary power-ups: kind -> expiry timestamp (ms). A kind only
+        # counts as "active" while now_ms < active_powerups[kind]; we
+        # don't proactively delete expired entries, has_powerup() just
+        # ignores them, which keeps activate_powerup() a single dict write.
+        self.active_powerups = {}
+
         # When pygame.time.get_ticks() < invuln_until_ms, we ignore hits
         # and flicker the sprite to signal "just respawned".
         self.invuln_until_ms = pygame.time.get_ticks() + PLAYER_INVULN_MS
@@ -416,6 +472,18 @@ class Player:
 
     def is_invulnerable(self, now_ms):
         return now_ms < self.invuln_until_ms
+
+    def effective_speed(self):
+        """Base movement speed plus any permanent Boss-kill bonuses."""
+        return PLAYER_SPEED + self.permanent_speed_bonus
+
+    def activate_powerup(self, kind, now_ms):
+        """Start (or refresh) a timed effect. Called on pickup collision."""
+        self.active_powerups[kind] = now_ms + POWERUP_DURATION_MS
+
+    def has_powerup(self, kind, now_ms):
+        """True if `kind` is currently active (hasn't expired yet)."""
+        return now_ms < self.active_powerups.get(kind, 0)
 
     def update(self, keys, now_ms):
         # --- Movement --------------------------------------------------
@@ -439,8 +507,8 @@ class Player:
             dx /= length
             dy /= length
 
-        self.x += dx * PLAYER_SPEED
-        self.y += dy * PLAYER_SPEED
+        self.x += dx * self.effective_speed()
+        self.y += dy * self.effective_speed()
 
         # Keep the ship inside the play area.
         half_w = PLAYER_WIDTH / 2
@@ -457,20 +525,33 @@ class Player:
         self.rect.center = (int(self.x), int(self.y))
 
     def can_shoot(self, now_ms):
-        return (now_ms - self.last_shot_time_ms) >= PLAYER_FIRE_COOLDOWN_MS
+        # rapid_fire replaces the normal cooldown with a much shorter one.
+        cooldown = (
+            PLAYER_RAPID_FIRE_COOLDOWN_MS
+            if self.has_powerup(POWERUP_KIND_RAPID_FIRE, now_ms)
+            else PLAYER_FIRE_COOLDOWN_MS
+        )
+        return (now_ms - self.last_shot_time_ms) >= cooldown
 
     def shoot(self, bullets, now_ms):
-        """Spawn a bullet just above the ship's nose."""
+        """Spawn one bullet (or two, side-by-side, during double_shot)."""
         if not self.can_shoot(now_ms):
             return
         self.last_shot_time_ms = now_ms
-        bullets.append(Bullet(
-            x=self.x,
-            y=self.y - PLAYER_HEIGHT / 2,
-            vy=-PLAYER_BULLET_SPEED,    # Negative = moving UP the screen.
-            color=COLOR_PLAYER_BULLET,
-            is_player_bullet=True,
-        ))
+
+        if self.has_powerup(POWERUP_KIND_DOUBLE_SHOT, now_ms):
+            x_offsets = (-PLAYER_DOUBLE_SHOT_OFFSET, PLAYER_DOUBLE_SHOT_OFFSET)
+        else:
+            x_offsets = (0,)
+
+        for x_offset in x_offsets:
+            bullets.append(Bullet(
+                x=self.x + x_offset,
+                y=self.y - PLAYER_HEIGHT / 2,
+                vy=-PLAYER_BULLET_SPEED,    # Negative = moving UP the screen.
+                color=COLOR_PLAYER_BULLET,
+                is_player_bullet=True,
+            ))
 
     def can_use_special(self, now_ms):
         """True if the player has ammo left AND the cooldown has passed.
@@ -761,13 +842,19 @@ class Boss:
         self.rect.center = (int(self.x), int(self.y))
 
     def update(self, bullets):
-        # Move straight down + a little sideways sine-wave wobble.
+        # Unlike a regular Enemy, the Boss descends to a fixed hover
+        # line (ENEMY_BOSS_HOVER_Y) and then STOPS descending -- it just
+        # wobbles side to side and keeps firing. Without this override
+        # it would inherit straight-down movement, drift off the bottom
+        # of the screen within a few seconds, and die "off-screen"
+        # before the player could realistically bring its 80 HP down.
         self.age_frames += 1
-        self.y += self.speed
-        wobble_dx = math.sin(self.age_frames * 0.05 + self.wobble_phase)
-        self.x += wobble_dx * self.wobble_amount
+        if self.y < ENEMY_BOSS_HOVER_Y:
+            self.y += self.speed
 
-        # Stay on-screen horizontally (for tanks especially, the sprite is wide).
+        wobble_dx = math.sin(self.age_frames * 0.03 + self.wobble_phase)
+        self.x += wobble_dx * self.wobble_amount * 2
+
         half = self.size / 2
         if self.x < half:
             self.x = half
@@ -776,14 +863,9 @@ class Boss:
 
         self.rect.center = (int(self.x), int(self.y))
 
-        # If we've left the bottom, mark dead so the game removes us.
-        if self.y - half > SCREEN_HEIGHT:
-            self.alive = False
-            return
-
-        # Random chance to shoot. Only shoot once we're actually on-screen,
-        # so the player isn't surprised by bullets from invisible enemies.
-        if self.y > 0 and random.random() < self.fire_chance:
+        # Only fire once it's reached the hover line -- otherwise it
+        # could start shooting while still off-screen above the player.
+        if self.y >= ENEMY_BOSS_HOVER_Y and random.random() < self.fire_chance:
             bullets.append(Bullet(
                 x=self.x,
                 y=self.y + half,
@@ -879,6 +961,67 @@ class Boss:
 # ---------------------------------------------------------------------
 # Particle: a single dot in an explosion.
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# PowerUp: a temporary-effect pickup dropped by defeated enemies.
+# ---------------------------------------------------------------------
+class PowerUp:
+    """A pickup that drifts downward and grants a timed effect on contact.
+
+    `kind` is one of the POWERUP_KIND_* constants. The PowerUp itself
+    doesn't track *when* the effect ends — that timer lives on the
+    Player (see Player.activate_powerup), the same way Player already
+    tracks its own invulnerability window with a `..._until_ms` field.
+    This object's only job is to exist, fall, and be picked up.
+    """
+    _glyph_font = None  # Lazily created on first draw(); shared by all instances.
+
+    def __init__(self, x, y, kind):
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.alive = True
+        self.color = (
+            COLOR_POWERUP_DOUBLE_SHOT if kind == POWERUP_KIND_DOUBLE_SHOT
+            else COLOR_POWERUP_RAPID_FIRE
+        )
+        self.rect = pygame.Rect(0, 0, POWERUP_SIZE, POWERUP_SIZE)
+        self.rect.center = (int(x), int(y))
+
+    def update(self):
+        self.y += POWERUP_FALL_SPEED
+        self.rect.centery = int(self.y)
+        if self.y - POWERUP_SIZE / 2 > SCREEN_HEIGHT:
+            self.alive = False
+
+    def draw(self, surface):
+        cx, cy = int(self.x), int(self.y)
+        half = POWERUP_SIZE // 2
+        # A pulsing glowing diamond — the same "this is special" language
+        # as the special-attack ammo icons in the HUD, so pickups read as
+        # related to that system even though the mechanic differs.
+        pulse = (math.sin(pygame.time.get_ticks() * 0.008) + 1) / 2
+        r = half + int(2 * pulse)
+        points = [
+            (cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy),
+        ]
+        draw_glow_polygon(surface, points, self.color, spread=3, layers=3, max_alpha=100)
+        pygame.draw.polygon(surface, self.color, points)
+        pygame.draw.polygon(surface, NEON_WHITE, points, width=1)
+
+        # A tiny letter in the center as a legend-free hint at what it
+        # does: "2" for double_shot, ">" (rapid) for rapid_fire. Cached
+        # on the class so we're not building a new Font 60 times a
+        # second per pickup on screen.
+        if PowerUp._glyph_font is None:
+            PowerUp._glyph_font = pygame.font.SysFont(None, 18)
+        glyph = "2" if self.kind == POWERUP_KIND_DOUBLE_SHOT else ">"
+        glyph_surf = PowerUp._glyph_font.render(glyph, True, (20, 20, 20))
+        surface.blit(
+            glyph_surf,
+            (cx - glyph_surf.get_width() // 2, cy - glyph_surf.get_height() // 2),
+        )
+
+
 class Particle:
     """One spark of an explosion.
 
@@ -957,13 +1100,23 @@ class Game:
         self.enemy_bullets = []
         self.enemies = []
         self.particles = []
+        self.powerups = []
         self._boss_spawned = False
+        self.level = 1
         # Edge-detection flag for the 'B' special-attack key -- see
         # _handle_continuous_input. Without this, holding B down would
         # fire (and consume ammo for) the special every single frame.
         self._b_key_was_held = False
 
         self.stars = [Star() for _ in range(NUM_STARS)]
+
+        # Restore the level-1 sky palette in case a previous run advanced
+        # to level 2 and left the (module-level) colors changed -- see
+        # _advance_to_level_2. Without this, starting a new game after
+        # beating a Boss would keep the level-2 sky.
+        global COLOR_BG_TOP, COLOR_BG_BOTTOM
+        COLOR_BG_TOP = _ORIGINAL_COLOR_BG_TOP
+        COLOR_BG_BOTTOM = _ORIGINAL_COLOR_BG_BOTTOM
 
         # Spawn timing:
         now_ms = pygame.time.get_ticks()
@@ -1080,6 +1233,10 @@ class Game:
         for p in self.particles:
             p.update()
 
+        # 5b) Power-ups (falling pickups dropped by defeated enemies)
+        for pu in self.powerups:
+            pu.update()
+
         # 6) Collisions
         self._handle_collisions(now_ms)
 
@@ -1090,6 +1247,7 @@ class Game:
         self.enemy_bullets  = [b for b in self.enemy_bullets  if b.alive]
         self.enemies        = [e for e in self.enemies        if e.alive]
         self.particles      = [p for p in self.particles      if p.alive]
+        self.powerups       = [pu for pu in self.powerups     if pu.alive]
 
         # 8) Game over check
         if self.player.lives <= 0:
@@ -1109,18 +1267,7 @@ class Game:
                     bullet.alive = False
                     died = enemy.take_damage(bullet.damage)
                     if died:
-                        self.score += enemy.score
-                        if self.score >= 1000 and not self._boss_spawned:
-                            # NOTE: this replaces the original `Boss(self)`
-                            # call, which built a Boss but never added it to
-                            # `self.enemies` (so it was never drawn/updated)
-                            # and passed an argument the constructor didn't
-                            # accept. `_boss_spawned` stops it from spawning
-                            # a fresh Boss on every kill once the threshold
-                            # is passed.
-                            self.enemies.append(Boss())
-                            self._boss_spawned = True
-                        self._spawn_explosion(enemy.x, enemy.y)
+                        self._handle_enemy_death(enemy, full_score=True)
                     break  # One bullet, one hit.
 
         # --- Enemy bullets vs player ----------------------------------
@@ -1139,10 +1286,71 @@ class Game:
             if enemy.rect.colliderect(self.player.rect):
                 if self.player.hit(now_ms):
                     self._spawn_explosion(self.player.x, self.player.y)
-                # Ramming kills the enemy too — feels fair and clears the screen.
+                # Ramming kills the enemy too — feels fair and clears the
+                # screen — but only for half score, same as a normal kill
+                # would be worth if you'd chipped it down instead of
+                # ramming it. Goes through the same death handling as a
+                # bullet kill so a rammed Boss still grants its reward.
                 enemy.alive = False
-                self.score += enemy.score // 2
-                self._spawn_explosion(enemy.x, enemy.y)
+                self._handle_enemy_death(enemy, full_score=False)
+
+        # --- Player vs power-ups ---------------------------------------
+        for pu in self.powerups:
+            if not pu.alive:
+                continue
+            if pu.rect.colliderect(self.player.rect):
+                pu.alive = False
+                self.player.activate_powerup(pu.kind, now_ms)
+
+    def _handle_enemy_death(self, enemy, full_score=True):
+        """Shared death handling for both bullet kills and ramming.
+
+        Centralizing this means the Boss-defeat reward and the regular
+        power-up drop both trigger no matter *how* the enemy died,
+        instead of only being wired up in one of the two collision paths.
+        """
+        self.score += enemy.score if full_score else enemy.score // 2
+        self._spawn_explosion(enemy.x, enemy.y)
+
+        if isinstance(enemy, Boss):
+            self._on_boss_defeated()
+            return  # Bosses don't drop the regular temporary power-ups.
+
+        # Only non-Boss kills can trigger the *next* Boss to spawn, and
+        # only non-Boss kills can drop a temporary power-up.
+        if self.score >= 1000 and not self._boss_spawned:
+            self.enemies.append(Boss())
+            self._boss_spawned = True
+
+        if random.random() < POWERUP_DROP_CHANCE:
+            kind = random.choice(POWERUP_KINDS)
+            self.powerups.append(PowerUp(enemy.x, enemy.y, kind))
+
+    def _on_boss_defeated(self):
+        """Boss reward: a permanent, stacking speed buff + level 2 sky.
+
+        The speed buff stacks additively (see Player.effective_speed) and
+        is completely independent from the timed power-ups — a player
+        could have rapid_fire active, pick up double_shot, AND carry a
+        permanent speed bonus all at the same time; they're tracked in
+        totally separate places on Player (a float vs. a dict of timers).
+        """
+        self.player.permanent_speed_bonus += BOSS_PERMANENT_SPEED_BONUS
+        self.level += 1
+        self._advance_to_level_2()
+
+    def _advance_to_level_2(self):
+        """Swap the sky gradient to the level-2 palette.
+
+        COLOR_BG_TOP / COLOR_BG_BOTTOM are read directly by
+        _draw_background() as module-level globals, so we reassign them
+        here with `global` rather than threading a "current palette"
+        value through the draw call — the smallest change that makes
+        the existing background code pick up the new colors automatically.
+        """
+        global COLOR_BG_TOP, COLOR_BG_BOTTOM
+        COLOR_BG_TOP = LEVEL_2_COLOR_BG_TOP
+        COLOR_BG_BOTTOM = LEVEL_2_COLOR_BG_BOTTOM
 
     # -----------------------------------------------------------------
     # Drawing
@@ -1162,6 +1370,9 @@ class Game:
 
         for e in self.enemies:
             e.draw(self.screen)
+
+        for pu in self.powerups:
+            pu.draw(self.screen)
 
         for b in self.player_bullets:
             b.draw(self.screen)
@@ -1314,6 +1525,34 @@ class Game:
                 (icon_x + 14, icon_y + 14),
             ]
             pygame.draw.polygon(self.screen, COLOR_PLAYER, points)
+
+        # Level indicator (below lives, top-right) — only interesting once
+        # it's changed from 1, but always shown for consistency.
+        level_surf = self.font_small.render(f"LEVEL {self.level}", True, COLOR_HUD_DIM)
+        self.screen.blit(
+            level_surf,
+            (SCREEN_WIDTH - HUD_MARGIN - level_surf.get_width(),
+             HUD_MARGIN + lives_label.get_height() + 6),
+        )
+
+        # Active temporary power-ups (bottom-right) — name + a countdown
+        # in seconds, so the player knows exactly how long they've got
+        # left rather than being surprised when it wears off.
+        now_ms = pygame.time.get_ticks()
+        active = [
+            (kind, expiry) for kind, expiry in self.player.active_powerups.items()
+            if now_ms < expiry
+        ]
+        for row, (kind, expiry) in enumerate(active):
+            remaining_s = (expiry - now_ms) / 1000.0
+            label = "DOUBLE SHOT" if kind == POWERUP_KIND_DOUBLE_SHOT else "RAPID FIRE"
+            color = COLOR_POWERUP_DOUBLE_SHOT if kind == POWERUP_KIND_DOUBLE_SHOT else COLOR_POWERUP_RAPID_FIRE
+            surf = self.font_small.render(f"{label}  {remaining_s:0.1f}s", True, color)
+            self.screen.blit(
+                surf,
+                (SCREEN_WIDTH - HUD_MARGIN - surf.get_width(),
+                 SCREEN_HEIGHT - HUD_MARGIN - surf.get_height() * (row + 1) - row * 4),
+            )
 
         # Hint line (bottom-left) — only while playing, fades after a bit.
         elapsed_ms = pygame.time.get_ticks() - self.start_ms
