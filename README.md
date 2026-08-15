@@ -38,6 +38,26 @@ Contexto: Menciona los métodos exactos de su script (_handle_continuous_input()
 
 Fundamentación: Explica que la mecánica busca darle al jugador una opción estratégica de defensa ante situaciones de peligro.
 
+-Fase de progresión de Nivel, Bosses y Power-ups Acumulables
+
+Objetivo: Programar la aparición de objetos coleccionables (power-ups temporales), el enfrentamiento contra el Boss, el otorgamiento de mejoras permanentes acumulables y el cambio de color del escenario al subir de nivel.
+
+Prompt Exacto:
+
+"Necesito implementar el ciclo completo de progresión de nivel y power-ups en mi código de Pygame. Actualmente mi clase Boss no está integrada correctamente en _handle_collisions(). Requiero: 1) Una clase PowerUp que caiga del techo al destruir enemigos dando 'doble disparo' o 'disparo rápido' durante 5 segundos usando pygame.time.get_ticks(), 2) Hacer que al derrotar al Boss el jugador reciba una mejora permanente de velocidad que se pueda acumular (stackear) con los power-ups temporales, y 3) Cambiar los colores de las constantes COLOR_BG_TOP y COLOR_BG_BOTTOM para simular que avanzamos al Nivel 2. Te consulto esto porque me cuesta coordinar los temporizadores no bloqueantes y el cambio de nivel tras la muerte del Boss. Por favor, dame un ejemplo de código corto donde se muestre la colisión con el Boss, la entrega del poder permanente y la actualización del degradado de fondo."
+
+Fundamentación (Las 4 Reglas de Oro):
+
+Claridad: Solicita la clase PowerUp, temporizadores no bloqueantes, stacking de poderes permanentes y cambio de colores del mapa.
+
+Contexto: Señala la falla en la llamada a Boss en _handle_collisions() de su código actual y el uso de degradados de color en el fondo.
+
+Fundamentación: Expresa la dificultad técnica de gestionar estados temporales con pygame.time.get_ticks() sin congelar el juego.
+
+Solicitud de ejemplos: Pide un ejemplo enfocado en la colisión del Boss, entrega de mejoras y la transición visual entre niveles.
+
+Verificación: Invocé correctamente la clase Boss al alcanzar cierto puntaje, comprobé que al destruirlo soltara la mejora, verifiqué con un print() de consola que los temporizadores de los buffs temporales convivieran sin conflictos con la mejora permanente de velocidad, y confirmé que el fondo cambiara de color a un tono azul/púrpura al pasar al Nivel 2.
+
 Solicitud de ejemplos: Solicita un ejemplo de código que muestre la detección de la tecla 'B', la modificación a Bullet y el dibujo en el HUD.
 
 Verificación: Asigné una variable self.special_ammo = 3 en Player, probé presionar 'B' en partida para confirmar que solo disparaba si la munición era mayor a 0, verifiqué que la bala especial fuera más grande/destructiva y comprobé que el contador del HUD se actualizara en tiempo real.
