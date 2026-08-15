@@ -103,6 +103,22 @@ PLAYER_BULLET_SPEED = 10.0    # How fast your shots travel upward.
 PLAYER_BULLET_WIDTH = 4
 PLAYER_BULLET_HEIGHT = 14
 
+# --- Special attack ('B' key) -----------------------------------------
+# A limited-ammo, high-impact volley meant as an emergency "get me out of
+# this" button when the screen fills up with enemies. Deliberately much
+# stronger per-bullet than the regular shot, but scarce.
+PLAYER_SPECIAL_START_AMMO = 3      # Charges available on a fresh game.
+PLAYER_SPECIAL_COOLDOWN_MS = 600   # Minimum time between uses, even with
+                                    # ammo to spare — stops instant double
+                                    # taps from a single key-down.
+PLAYER_SPECIAL_BULLET_COUNT = 5    # Bullets fired per use, in a fan.
+PLAYER_SPECIAL_BULLET_SPREAD_DEG = 40  # Total angular spread of the fan.
+PLAYER_SPECIAL_BULLET_SPEED = 12.0
+PLAYER_SPECIAL_BULLET_WIDTH = 10   # Visibly bigger than a normal bullet.
+PLAYER_SPECIAL_BULLET_HEIGHT = 22
+PLAYER_SPECIAL_BULLET_DAMAGE = 3   # Regular shots deal 1; this hits hard.
+COLOR_PLAYER_SPECIAL_BULLET = (170, 120, 255)  # Violet, reads as "different".
+
 ENEMY_BULLET_SPEED = 4.5      # How fast enemy shots travel downward.
                               # Keep this well below player bullet speed
                               # so the player can outrun their own shots.
@@ -145,7 +161,7 @@ ENEMY_TANK_FIRE_CHANCE = 0.008
 
 ENEMY_BOSS_SIZE = 80
 ENEMY_BOSS_SPEED = 1.4
-ENEMY_BOSS_HP = 10
+ENEMY_BOSS_HP = 80
 ENEMY_BOSS_SCORE = 500
 ENEMY_BOSS_FIRE_CHANCE = 0.003
 
@@ -289,18 +305,35 @@ class Bullet:
 
     `vy` (vertical velocity) is negative for upward (player) shots
     and positive for downward (enemy) shots. The same class handles both.
+
+    `vx` (horizontal velocity) defaults to 0 for normal straight-up/down
+    shots, but is used by the special attack's fan spread below.
+
+    `is_special` marks the bigger, higher-damage variant fired by the
+    player's limited-ammo special attack (see Player.use_special). It's
+    always a player bullet; passing is_special=True implies
+    is_player_bullet=True regardless of what's passed for that argument.
     """
-    def __init__(self, x, y, vy, color, is_player_bullet):
+    def __init__(self, x, y, vy, color, is_player_bullet,
+                 vx=0.0, damage=1, is_special=False):
         self.x = x
         self.y = y
+        self.vx = vx
         self.vy = vy
         self.color = color
-        self.is_player_bullet = is_player_bullet
+        self.is_player_bullet = is_player_bullet or is_special
+        self.is_special = is_special
+        self.damage = damage
         self.alive = True
-        # Player bullets are little rectangles; enemy bullets are circles.
-        # That makes it easier for the player to distinguish friend from foe
-        # at a glance — a small but important readability trick.
-        if is_player_bullet:
+
+        # Player bullets are little rectangles; enemy bullets are circles;
+        # special bullets are bigger rectangles so they read as "stronger"
+        # at a glance. That makes it easy to distinguish friend/foe/special
+        # without needing a legend.
+        if is_special:
+            w, h = PLAYER_SPECIAL_BULLET_WIDTH, PLAYER_SPECIAL_BULLET_HEIGHT
+            self.rect = pygame.Rect(int(x - w / 2), int(y - h / 2), w, h)
+        elif self.is_player_bullet:
             self.rect = pygame.Rect(
                 int(x - PLAYER_BULLET_WIDTH / 2),
                 int(y - PLAYER_BULLET_HEIGHT / 2),
@@ -312,16 +345,30 @@ class Bullet:
             self.rect = pygame.Rect(int(x - r), int(y - r), r * 2, r * 2)
 
     def update(self):
+        self.x += self.vx
         self.y += self.vy
         # Sync the collision rectangle to the new position.
         self.rect.centery = int(self.y)
         self.rect.centerx = int(self.x)
-        # Mark dead once off-screen (top or bottom).
-        if self.y < -20 or self.y > SCREEN_HEIGHT + 20:
+        # Mark dead once off-screen (top, bottom, or now sides too, since
+        # the special attack's fan can drift out horizontally).
+        if (self.y < -20 or self.y > SCREEN_HEIGHT + 20
+                or self.x < -20 or self.x > SCREEN_WIDTH + 20):
             self.alive = False
 
     def draw(self, surface):
-        if self.is_player_bullet:
+        if self.is_special:
+            # Bright core rectangle plus a thin glowing outline so it
+            # stands out clearly from regular shots at a glance.
+            draw_glow_polygon(
+                surface,
+                [self.rect.topleft, self.rect.topright,
+                 self.rect.bottomright, self.rect.bottomleft],
+                self.color, spread=3, layers=3, max_alpha=100,
+            )
+            pygame.draw.rect(surface, self.color, self.rect, border_radius=4)
+            pygame.draw.rect(surface, NEON_WHITE, self.rect, width=1, border_radius=4)
+        elif self.is_player_bullet:
             # A bright rectangle with a slightly lighter center for "pew" feel.
             pygame.draw.rect(surface, self.color, self.rect, border_radius=2)
         else:
@@ -353,6 +400,11 @@ class Player:
         self.y = SCREEN_HEIGHT - PLAYER_HEIGHT * 1.5
         self.lives = PLAYER_START_LIVES
         self.last_shot_time_ms = 0
+        # Limited-ammo special attack (see use_special below). Separate
+        # cooldown from the regular shot so mashing 'B' can't bypass the
+        # brief "can't refire instantly" window even while ammo remains.
+        self.special_ammo = PLAYER_SPECIAL_START_AMMO
+        self.last_special_time_ms = -PLAYER_SPECIAL_COOLDOWN_MS
         # When pygame.time.get_ticks() < invuln_until_ms, we ignore hits
         # and flicker the sprite to signal "just respawned".
         self.invuln_until_ms = pygame.time.get_ticks() + PLAYER_INVULN_MS
@@ -419,6 +471,58 @@ class Player:
             color=COLOR_PLAYER_BULLET,
             is_player_bullet=True,
         ))
+
+    def can_use_special(self, now_ms):
+        """True if the player has ammo left AND the cooldown has passed.
+
+        The cooldown exists on top of the ammo check so a single 'B'
+        key-down can't somehow fire twice in the same frame/near-frame;
+        it's mostly a safety net, since the actual "don't fire every
+        frame while held" logic lives in Game._handle_continuous_input
+        via edge-detection.
+        """
+        if self.special_ammo <= 0:
+            return False
+        return (now_ms - self.last_special_time_ms) >= PLAYER_SPECIAL_COOLDOWN_MS
+
+    def use_special(self, bullets, now_ms):
+        """Consume one special charge and fire a fan of big bullets.
+
+        Returns True if the attack actually fired (False if it was on
+        cooldown or out of ammo), so the caller can decide whether to
+        e.g. play a "no ammo" sound/flash instead.
+        """
+        if not self.can_use_special(now_ms):
+            return False
+
+        self.special_ammo -= 1
+        self.last_special_time_ms = now_ms
+
+        # Fan the bullets out evenly across PLAYER_SPECIAL_BULLET_SPREAD_DEG,
+        # centered straight up (-90 degrees in standard screen-space angles,
+        # where 0 degrees points right and angles increase clockwise).
+        count = PLAYER_SPECIAL_BULLET_COUNT
+        spread = math.radians(PLAYER_SPECIAL_BULLET_SPREAD_DEG)
+        base_angle = -math.pi / 2  # Straight up.
+        start_angle = base_angle - spread / 2
+        step = spread / max(1, count - 1) if count > 1 else 0.0
+
+        origin_y = self.y - PLAYER_HEIGHT / 2
+        for i in range(count):
+            angle = start_angle + step * i
+            vx = math.cos(angle) * PLAYER_SPECIAL_BULLET_SPEED
+            vy = math.sin(angle) * PLAYER_SPECIAL_BULLET_SPEED
+            bullets.append(Bullet(
+                x=self.x,
+                y=origin_y,
+                vx=vx,
+                vy=vy,
+                color=COLOR_PLAYER_SPECIAL_BULLET,
+                is_player_bullet=True,
+                is_special=True,
+                damage=PLAYER_SPECIAL_BULLET_DAMAGE,
+            ))
+        return True
 
     def hit(self, now_ms):
         """Called when an enemy or enemy bullet touches the ship.
@@ -854,6 +958,10 @@ class Game:
         self.enemies = []
         self.particles = []
         self._boss_spawned = False
+        # Edge-detection flag for the 'B' special-attack key -- see
+        # _handle_continuous_input. Without this, holding B down would
+        # fire (and consume ammo for) the special every single frame.
+        self._b_key_was_held = False
 
         self.stars = [Star() for _ in range(NUM_STARS)]
 
@@ -921,6 +1029,18 @@ class Game:
         if keys[pygame.K_SPACE] or keys[pygame.K_z]:
             self.player.shoot(self.player_bullets, now_ms)
 
+        # Special attack on 'B'. keys[] is a snapshot of "is this key down
+        # right now", so if we fired every frame it was held, one long
+        # press would drain all 3 charges almost instantly. We only fire
+        # on the frame the key transitions from up -> down (the "rising
+        # edge"), then wait for it to be released before it can fire
+        # again -- exactly like a single key-press event, but read here
+        # via polling instead of pygame's event queue.
+        b_key_held = keys[pygame.K_b]
+        if b_key_held and not self._b_key_was_held:
+            self.player.use_special(self.player_bullets, now_ms)
+        self._b_key_was_held = b_key_held
+
     # -----------------------------------------------------------------
     # Per-frame update
     # -----------------------------------------------------------------
@@ -987,7 +1107,7 @@ class Game:
                     continue
                 if bullet.rect.colliderect(enemy.rect):
                     bullet.alive = False
-                    died = enemy.take_damage(1)
+                    died = enemy.take_damage(bullet.damage)
                     if died:
                         self.score += enemy.score
                         if self.score >= 1000 and not self._boss_spawned:
@@ -1151,6 +1271,32 @@ class Game:
         )
         self.screen.blit(score_surf, (HUD_MARGIN, HUD_MARGIN))
 
+        # Special ammo (below the score, top-left) — a small diamond icon
+        # per charge, colored to match the special bullets themselves so
+        # the HUD and the projectiles read as "the same thing".
+        ammo_y = HUD_MARGIN + score_surf.get_height() + 6
+        ammo_label = self.font_small.render("SPECIAL", True, COLOR_HUD_DIM)
+        self.screen.blit(ammo_label, (HUD_MARGIN, ammo_y))
+        icon_start_x = HUD_MARGIN + ammo_label.get_width() + 8
+        max_ammo = PLAYER_SPECIAL_START_AMMO
+        for i in range(max_ammo):
+            icon_x = icon_start_x + i * 16
+            icon_cy = ammo_y + ammo_label.get_height() // 2
+            filled = i < self.player.special_ammo
+            color = COLOR_PLAYER_SPECIAL_BULLET if filled else (60, 55, 75)
+            # A tiny diamond (rotated square) reads as "ammo charge" more
+            # distinctly than another triangle, which is already used for
+            # lives just below.
+            points = [
+                (icon_x + 5, icon_cy - 6),
+                (icon_x + 10, icon_cy),
+                (icon_x + 5, icon_cy + 6),
+                (icon_x, icon_cy),
+            ]
+            pygame.draw.polygon(self.screen, color, points)
+            if filled:
+                pygame.draw.polygon(self.screen, NEON_WHITE, points, width=1)
+
         # Lives (top-right) — one tiny ship icon per life.
         lives_label = self.font_small.render("LIVES", True, COLOR_HUD_DIM)
         self.screen.blit(
@@ -1173,7 +1319,7 @@ class Game:
         elapsed_ms = pygame.time.get_ticks() - self.start_ms
         if self.state == Game.STATE_PLAYING and elapsed_ms < 4000:
             hint = self.font_small.render(
-                "Move: arrows/WASD   Shoot: Space/Z   Pause: P",
+                "Move: arrows/WASD   Shoot: Space/Z   Special: B   Pause: P",
                 True, COLOR_HUD_DIM,
             )
             self.screen.blit(
