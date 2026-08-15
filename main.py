@@ -24,6 +24,7 @@ basic shape primitives so you can read and tweak it easily.
 """
 
 import math
+import os
 import random
 import sys
 
@@ -226,9 +227,134 @@ EXPLOSION_LIFE_FRAMES = 30    # How many frames each particle lives.
 HUD_FONT_SIZE = 22
 HUD_MARGIN = 10               # Distance from screen edges, in pixels.
 
+# --- Audio --------------------------------------------------------------
+# Paths are resolved relative to this file (not the current working
+# directory), so the game finds its assets no matter where it's launched
+# from. See SoundManager below for how these are actually loaded/played.
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+SFX_DIR = os.path.join(_ASSETS_DIR, "sfx")
+MUSIC_DIR = os.path.join(_ASSETS_DIR, "music")
+
+SFX_PATHS = {
+    "shoot":     os.path.join(SFX_DIR, "shoot.wav"),
+    "special":   os.path.join(SFX_DIR, "special.wav"),
+    "hit":       os.path.join(SFX_DIR, "hit.wav"),
+    "explosion": os.path.join(SFX_DIR, "explosion.wav"),
+}
+SFX_VOLUME = 0.6
+
+MUSIC_KEY_LEVEL1 = "level1"
+MUSIC_KEY_BOSS = "boss"
+MUSIC_PATHS = {
+    MUSIC_KEY_LEVEL1: os.path.join(MUSIC_DIR, "level1_ambient.wav"),
+    MUSIC_KEY_BOSS:   os.path.join(MUSIC_DIR, "boss_battle.wav"),
+}
+MUSIC_VOLUME = 0.45
+MUSIC_CROSSFADE_MS = 900   # Fade-out old track / fade-in new track, each.
+
+# Custom pygame event fired when pygame.mixer.music finishes playing --
+# including finishing a fadeout. SoundManager uses this to know exactly
+# when it's safe to swap in the next track (see play_music / on_music_end).
+MUSIC_END_EVENT = pygame.USEREVENT + 1
+
 # =====================================================================
 # END OF CONFIGURATION
 # =====================================================================
+
+
+# ---------------------------------------------------------------------
+# SoundManager: wraps pygame.mixer for both SFX and background music.
+# ---------------------------------------------------------------------
+class SoundManager:
+    """Owns every Sound object plus the background-music state machine.
+
+    Two separate pygame audio facilities are used here, and it's worth
+    knowing the difference:
+
+    - `pygame.mixer.Sound` / `.play()` — short one-shot effects (shoot,
+      hit, explosion...). Each call grabs a free "channel" from the
+      mixer's channel pool and plays there. Multiple sounds can overlap
+      freely, and none of them ever touch or interrupt...
+    - `pygame.mixer.music` — a SEPARATE, dedicated audio stream meant
+      for one long background track at a time (it's streamed from disk
+      instead of fully loaded into memory, which matters for longer
+      tracks). Because it's a different stream from the Sound channels,
+      playing SFX never cuts or stutters the music, and vice versa —
+      that separation is exactly what makes "sound effects overlapping
+      the music without interrupting it" work for free, with no manual
+      channel bookkeeping needed.
+
+    Every load is wrapped in try/except so a missing or corrupt asset
+    degrades to "silently do nothing" instead of crashing the game —
+    useful while you're still filling out the assets/ folder.
+    """
+    def __init__(self):
+        self._sfx = {}
+        self._music_ok = True
+        self._current_music_key = None   # Track currently playing (or fading out).
+        self._pending_music_key = None   # Track queued to start once the fade-out ends.
+
+        for name, path in SFX_PATHS.items():
+            try:
+                sound = pygame.mixer.Sound(path)
+                sound.set_volume(SFX_VOLUME)
+                self._sfx[name] = sound
+            except (pygame.error, FileNotFoundError) as e:
+                print(f"[SoundManager] Could not load SFX '{name}' ({path}): {e}")
+
+        pygame.mixer.music.set_volume(MUSIC_VOLUME)
+        # Fires MUSIC_END_EVENT whenever the music stream stops on its
+        # own — including a fadeout completing. play_music() below relies
+        # on that to know exactly when it's safe to start the next track.
+        pygame.mixer.music.set_endevent(MUSIC_END_EVENT)
+
+    # -- SFX ------------------------------------------------------------
+    def play_sfx(self, name):
+        sound = self._sfx.get(name)
+        if sound is not None:
+            sound.play()
+
+    # -- Music ------------------------------------------------------------
+    def play_music(self, key, fade_ms=MUSIC_CROSSFADE_MS):
+        """Switch background music to `key`, crossfading smoothly.
+
+        If `key` is already playing (or already queued), this is a
+        no-op — calling it every frame while the Boss is on screen, for
+        instance, won't restart or re-fade the track.
+        """
+        if not self._music_ok:
+            return
+        if key == self._current_music_key or key == self._pending_music_key:
+            return
+
+        self._pending_music_key = key
+        if pygame.mixer.music.get_busy():
+            # Fade the current track out; on_music_end() (wired to
+            # MUSIC_END_EVENT in the main loop) starts the new one the
+            # moment the fade actually finishes, so the two never
+            # overlap or hard-cut into each other.
+            pygame.mixer.music.fadeout(fade_ms)
+        else:
+            self._start_pending_track(fade_ms)
+
+    def on_music_end(self):
+        """Call this when MUSIC_END_EVENT is received in the main loop."""
+        if self._pending_music_key is not None:
+            self._start_pending_track(MUSIC_CROSSFADE_MS)
+
+    def _start_pending_track(self, fade_ms):
+        key = self._pending_music_key
+        self._pending_music_key = None
+        self._current_music_key = key
+        path = MUSIC_PATHS.get(key)
+        if not path:
+            return
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play(loops=-1, fade_ms=fade_ms)
+        except (pygame.error, FileNotFoundError) as e:
+            print(f"[SoundManager] Could not load music '{key}' ({path}): {e}")
+            self._music_ok = False
 
 
 # ---------------------------------------------------------------------
@@ -534,9 +660,15 @@ class Player:
         return (now_ms - self.last_shot_time_ms) >= cooldown
 
     def shoot(self, bullets, now_ms):
-        """Spawn one bullet (or two, side-by-side, during double_shot)."""
+        """Spawn one bullet (or two, side-by-side, during double_shot).
+
+        Returns True if a shot actually fired (False if it was still on
+        cooldown), so the caller — Game._handle_continuous_input — knows
+        whether to play the shoot SFX rather than triggering it every
+        single frame Space/Z happens to be held.
+        """
         if not self.can_shoot(now_ms):
-            return
+            return False
         self.last_shot_time_ms = now_ms
 
         if self.has_powerup(POWERUP_KIND_DOUBLE_SHOT, now_ms):
@@ -552,6 +684,7 @@ class Player:
                 color=COLOR_PLAYER_BULLET,
                 is_player_bullet=True,
             ))
+        return True
 
     def can_use_special(self, now_ms):
         """True if the player has ammo left AND the cooldown has passed.
@@ -1079,10 +1212,11 @@ class Game:
     STATE_PAUSED = "paused"
     STATE_GAME_OVER = "game_over"
 
-    def __init__(self, screen, font_big, font_small):
+    def __init__(self, screen, font_big, font_small, sound):
         self.screen = screen
         self.font_big = font_big
         self.font_small = font_small
+        self.sound = sound
         self.reset()
         # Begin on the title screen rather than dropping straight into
         # gameplay -- reset() above still sets up a full, ready-to-play
@@ -1153,9 +1287,16 @@ class Game:
             ENEMY_SPAWN_INTERVAL_MIN_MS, new_interval
         )
 
-    def _spawn_explosion(self, x, y):
+    def _spawn_explosion(self, x, y, play_sfx=True):
         for _ in range(EXPLOSION_PARTICLES):
             self.particles.append(Particle(x, y))
+        # `play_sfx=False` is used for the player's own hit-explosion,
+        # where the "hit" SFX (played right alongside player.hit()) is
+        # the intended sound cue and we don't want it doubled up with
+        # "explosion" too. Every enemy-death explosion keeps the default,
+        # so destroying an enemy always plays its boom right here.
+        if play_sfx:
+            self.sound.play_sfx("explosion")
 
     # -----------------------------------------------------------------
     # Input
@@ -1166,21 +1307,27 @@ class Game:
             if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.state == Game.STATE_START:
                 self.state = Game.STATE_PLAYING
                 self.start_ms = pygame.time.get_ticks()  # Restart the HUD hint timer too.
+                self.sound.play_music(MUSIC_KEY_LEVEL1)
             # Pause toggling
             if event.key == pygame.K_p and self.state == Game.STATE_PLAYING:
                 self.state = Game.STATE_PAUSED
+                pygame.mixer.music.pause()  # Music pauses right alongside gameplay.
             elif event.key == pygame.K_p and self.state == Game.STATE_PAUSED:
                 self.state = Game.STATE_PLAYING
+                pygame.mixer.music.unpause()
             # Restart after game over
             elif event.key == pygame.K_r and self.state == Game.STATE_GAME_OVER:
                 self.reset()
+                self.state = Game.STATE_PLAYING
+                self.sound.play_music(MUSIC_KEY_LEVEL1)
 
     def _handle_continuous_input(self, now_ms):
         keys = pygame.key.get_pressed()
         self.player.update(keys, now_ms)
         # Holding Space or Z = continuous fire (rate-limited by cooldown).
         if keys[pygame.K_SPACE] or keys[pygame.K_z]:
-            self.player.shoot(self.player_bullets, now_ms)
+            if self.player.shoot(self.player_bullets, now_ms):
+                self.sound.play_sfx("shoot")
 
         # Special attack on 'B'. keys[] is a snapshot of "is this key down
         # right now", so if we fired every frame it was held, one long
@@ -1191,7 +1338,8 @@ class Game:
         # via polling instead of pygame's event queue.
         b_key_held = keys[pygame.K_b]
         if b_key_held and not self._b_key_was_held:
-            self.player.use_special(self.player_bullets, now_ms)
+            if self.player.use_special(self.player_bullets, now_ms):
+                self.sound.play_sfx("special")
         self._b_key_was_held = b_key_held
 
     # -----------------------------------------------------------------
@@ -1277,7 +1425,8 @@ class Game:
             if bullet.rect.colliderect(self.player.rect):
                 bullet.alive = False
                 if self.player.hit(now_ms):
-                    self._spawn_explosion(self.player.x, self.player.y)
+                    self.sound.play_sfx("hit")
+                    self._spawn_explosion(self.player.x, self.player.y, play_sfx=False)
 
         # --- Enemies vs player (ramming) ------------------------------
         for enemy in self.enemies:
@@ -1285,7 +1434,8 @@ class Game:
                 continue
             if enemy.rect.colliderect(self.player.rect):
                 if self.player.hit(now_ms):
-                    self._spawn_explosion(self.player.x, self.player.y)
+                    self.sound.play_sfx("hit")
+                    self._spawn_explosion(self.player.x, self.player.y, play_sfx=False)
                 # Ramming kills the enemy too — feels fair and clears the
                 # screen — but only for half score, same as a normal kill
                 # would be worth if you'd chipped it down instead of
@@ -1321,6 +1471,7 @@ class Game:
         if self.score >= 1000 and not self._boss_spawned:
             self.enemies.append(Boss())
             self._boss_spawned = True
+            self.sound.play_music(MUSIC_KEY_BOSS)  # Crossfades in smoothly.
 
         if random.random() < POWERUP_DROP_CHANCE:
             kind = random.choice(POWERUP_KINDS)
@@ -1338,6 +1489,9 @@ class Game:
         self.player.permanent_speed_bonus += BOSS_PERMANENT_SPEED_BONUS
         self.level += 1
         self._advance_to_level_2()
+        # Back to the calmer ambient track now that the fight is over —
+        # same crossfade mechanism as switching TO the Boss theme.
+        self.sound.play_music(MUSIC_KEY_LEVEL1)
 
     def _advance_to_level_2(self):
         """Swap the sky gradient to the level-2 palette.
@@ -1593,8 +1747,19 @@ class Game:
 # main(): set up Pygame, then run the loop until the user quits.
 # ---------------------------------------------------------------------
 def main():
-    # pygame.init initializes ALL pygame submodules (display, font, ...).
-    # If you're worried about startup time, you can init them individually.
+    # pygame.mixer.pre_init MUST be called before pygame.init() to take
+    # effect -- it configures the audio device (sample rate, bit depth,
+    # channel count, buffer size) before the mixer actually opens it.
+    # 44100/-16/2/512 is a solid, low-latency default: CD-quality sample
+    # rate, signed 16-bit samples, stereo, and a small buffer (fewer
+    # samples = less delay between a .play() call and hearing it, at the
+    # cost of being slightly more sensitive to underruns on very slow
+    # machines).
+    pygame.mixer.pre_init(44100, -16, 2, 512)
+
+    # pygame.init initializes ALL pygame submodules (display, font,
+    # mixer, ...). Because pre_init already ran, this picks up those
+    # settings when it brings the mixer online.
     pygame.init()
 
     # Create the window. The flags argument (3rd positional) can include
@@ -1612,7 +1777,11 @@ def main():
     font_small = pygame.font.SysFont(None, HUD_FONT_SIZE)
     font_big   = pygame.font.SysFont(None, HUD_FONT_SIZE * 3, bold=True)
 
-    game = Game(screen, font_big, font_small)
+    # SoundManager must be built AFTER pygame.init() (the mixer has to
+    # already be open before we can load Sounds or touch pygame.mixer.music).
+    sound = SoundManager()
+
+    game = Game(screen, font_big, font_small, sound)
 
     # The main loop. This pattern — events, update, draw, flip — is the
     # backbone of essentially every Pygame game.
@@ -1624,6 +1793,14 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 running = False
+            elif event.type == MUSIC_END_EVENT:
+                # The previously-playing track just finished fading out
+                # (or ended naturally) -- this is the non-blocking signal
+                # SoundManager.play_music() waits on before it's safe to
+                # load and fade in whatever track is queued next. Nothing
+                # in the main loop ever sleeps/blocks waiting for this;
+                # it's just another event like a keypress.
+                sound.on_music_end()
             else:
                 game.handle_event(event)
 
