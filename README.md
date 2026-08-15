@@ -61,3 +61,25 @@ Verificación: Invocé correctamente la clase Boss al alcanzar cierto puntaje, c
 Solicitud de ejemplos: Solicita un ejemplo de código que muestre la detección de la tecla 'B', la modificación a Bullet y el dibujo en el HUD.
 
 Verificación: Asigné una variable self.special_ammo = 3 en Player, probé presionar 'B' en partida para confirmar que solo disparaba si la munición era mayor a 0, verifiqué que la bala especial fuera más grande/destructiva y comprobé que el contador del HUD se actualizara en tiempo real.
+
+
+-Fase de integración del Sistema de Audio Dinámico (pygame.mixer)
+Herramienta: Claude (Anthropic)
+
+Objetivo: Incorporar música de fondo continuo, transiciones musicales dinámicas al aparecer el Boss y efectos de sonido para disparos, daño y explosiones usando pygame.mixer.
+
+Prompt Exacto:
+
+"Ayúdame a integrar el módulo pygame.mixer dentro de mi archivo main.py para sonorizar el juego. El proyecto actual carece por completo de audio. Requiero: 1) Reproducir una música de fondo ambiental en bucle para la etapa normal, 2) Cambiar dinámicamente esa música a un tema de 'Batalla contra Boss' cuando el jefe aparece en pantalla, y 3) Asignar efectos de sonido (pygame.mixer.Sound) cuando el jugador dispara (normal y tecla 'B'), recibe daño o destruye un enemigo en _spawn_explosion(). Hago esta consulta porque quiero que la música cambie suavemente al salir el Boss y que los efectos sonoros se escuchen simultáneamente sin cortar la música principal. Proporcióname un ejemplo de código de la inicialización del mixer en main() y las llamadas a .play() dentro de los métodos de evento y colisión correspondientes."
+
+Fundamentación (Las 4 Reglas de Oro):
+
+Claridad: Detalla el uso de pygame.mixer para música normal, tema de Boss y 4 efectos de sonido específicos.
+
+Contexto: Explica la arquitectura de su juego indicando exactamente en qué métodos (main(), _spawn_explosion(), eventos) deben sonar los audios.
+
+Fundamentación: Justifica la necesidad en lograr una atmósfera inmersiva con transiciones de audio limpias que no interrumpan la ejecución.
+
+Solicitud de ejemplos: Solicita el código exacto de inicialización, carga de archivos y llamadas de reproducción en la estructura de main.py.
+
+Verificación: Inicialicé pygame.mixer.init() en la función main(), cargué los archivos .wav y .mp3 descargados previamente, probé disparar repetidamente para verificar que no se cortara el audio, y forcé la aparición del Boss comprobando que la música cambiara al tema de batalla de forma fluida.
