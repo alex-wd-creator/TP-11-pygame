@@ -83,3 +83,7 @@ Fundamentación: Justifica la necesidad en lograr una atmósfera inmersiva con t
 Solicitud de ejemplos: Solicita el código exacto de inicialización, carga de archivos y llamadas de reproducción en la estructura de main.py.
 
 Verificación: Inicialicé pygame.mixer.init() en la función main(), cargué los archivos .wav y .mp3 descargados previamente, probé disparar repetidamente para verificar que no se cortara el audio, y forcé la aparición del Boss comprobando que la música cambiara al tema de batalla de forma fluida.
+
+
+
+- debo admitir que en este trabajo dependí bastante de la IA para su proceso
