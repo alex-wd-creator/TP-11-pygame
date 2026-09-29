@@ -23,6 +23,7 @@ images, sounds, or fonts. Everything visual is drawn with Pygame's
 basic shape primitives so you can read and tweak it easily.
 """
 
+import colorsys
 import math
 import os
 import random
@@ -54,8 +55,8 @@ WINDOW_TITLE = "Sky Striker"  # Text in the window's title bar.
 COLOR_BG_TOP    = (5, 5, 30)       # Sky color at the top of the screen.
 COLOR_BG_BOTTOM = (20, 0, 50)      # Sky color at the bottom (gradient).
 # COLOR_BG_TOP / COLOR_BG_BOTTOM are reassigned at runtime (via `global`)
-# when the player defeats a Boss, to simulate a level transition without
-# a full scene/state-machine rewrite. We snapshot the originals here so
+# when the player clears a Boss wave, to simulate a level transition
+# without a full scene/state-machine rewrite. We snapshot the originals so
 # Game.reset() can restore the level-1 sky when starting a new game.
 _ORIGINAL_COLOR_BG_TOP = COLOR_BG_TOP
 _ORIGINAL_COLOR_BG_BOTTOM = COLOR_BG_BOTTOM
@@ -171,6 +172,8 @@ ENEMY_BOSS_SPEED = 1.4
 ENEMY_BOSS_HP = 80
 ENEMY_BOSS_SCORE = 500
 ENEMY_BOSS_FIRE_CHANCE = 0.003
+ENEMY_BOSSES_PER_WAVE = 1
+BOSS_SPAWN_SCORE_INTERVAL = 5000
 # Unlike regular enemies, the Boss shouldn't just fly past and off the
 # bottom of the screen — it descends to this Y and then hovers there,
 # wobbling side to side, so the fight actually has time to happen.
@@ -201,10 +204,9 @@ PLAYER_DOUBLE_SHOT_OFFSET = 9       # Horizontal gap between the two
 # as a separate attribute, so both systems can be active at once).
 BOSS_PERMANENT_SPEED_BONUS = 1.2
 
-# --- Level 2 palette ------------------------------------------------------
-# Swapped into the (normally constant) COLOR_BG_TOP / COLOR_BG_BOTTOM
-# globals when the Boss dies, so the sky itself signals "new level"
-# without needing a scene/state-machine rewrite.
+# --- Level palettes -------------------------------------------------------
+# Level 2 keeps its original green palette. Later levels get a generated
+# palette so progression can continue without a fixed level cap.
 LEVEL_2_COLOR_BG_TOP = (5, 25, 10)     # Sky color at the top, level 2.
 LEVEL_2_COLOR_BG_BOTTOM = (0, 45, 15)  # Sky color at the bottom, level 2.
 
@@ -1235,7 +1237,9 @@ class Game:
         self.enemies = []
         self.particles = []
         self.powerups = []
-        self._boss_spawned = False
+        self._boss_wave_active = False
+        self._bosses_remaining = 0
+        self._next_boss_score = BOSS_SPAWN_SCORE_INTERVAL
         self.level = 1
         # Edge-detection flag for the 'B' special-attack key -- see
         # _handle_continuous_input. Without this, holding B down would
@@ -1245,9 +1249,7 @@ class Game:
         self.stars = [Star() for _ in range(NUM_STARS)]
 
         # Restore the level-1 sky palette in case a previous run advanced
-        # to level 2 and left the (module-level) colors changed -- see
-        # _advance_to_level_2. Without this, starting a new game after
-        # beating a Boss would keep the level-2 sky.
+        # and left the module-level colors changed.
         global COLOR_BG_TOP, COLOR_BG_BOTTOM
         COLOR_BG_TOP = _ORIGINAL_COLOR_BG_TOP
         COLOR_BG_BOTTOM = _ORIGINAL_COLOR_BG_BOTTOM
@@ -1279,7 +1281,7 @@ class Game:
 
     def _maybe_ramp_difficulty(self, now_ms):
         # Every DIFFICULTY_RAMP_SECONDS, shrink the spawn interval.
-        if now_ms - self.last_difficulty_ramp_ms < DIFFICULTY_RAMP_SECONDS * 1000:
+        if now_ms - self.last_difficulty_ramp_ms < DIFFICULTY_RAMP_SECONDS * 5000:
             return
         self.last_difficulty_ramp_ms = now_ms
         new_interval = self.current_spawn_interval_ms * DIFFICULTY_RAMP_FACTOR
@@ -1466,19 +1468,29 @@ class Game:
             self._on_boss_defeated()
             return  # Bosses don't drop the regular temporary power-ups.
 
-        # Only non-Boss kills can trigger the *next* Boss to spawn, and
-        # only non-Boss kills can drop a temporary power-up.
-        if self.score >= 1000 and not self._boss_spawned:
-            self.enemies.append(Boss())
-            self._boss_spawned = True
-            self.sound.play_music(MUSIC_KEY_BOSS)  # Crossfades in smoothly.
+        # Only regular enemy kills can trigger a Boss wave or drop a
+        # temporary power-up.
+        self._maybe_spawn_boss_wave()
 
         if random.random() < POWERUP_DROP_CHANCE:
             kind = random.choice(POWERUP_KINDS)
             self.powerups.append(PowerUp(enemy.x, enemy.y, kind))
 
+    def _maybe_spawn_boss_wave(self):
+        if self._boss_wave_active or self.score < self._next_boss_score:
+            return
+
+        self._boss_wave_active = True
+        self._bosses_remaining = ENEMY_BOSSES_PER_WAVE
+        for index in range(ENEMY_BOSSES_PER_WAVE):
+            boss = Boss()
+            boss.x = SCREEN_WIDTH * (index + 1) / (ENEMY_BOSSES_PER_WAVE + 1)
+            boss.rect.center = (int(boss.x), int(boss.y))
+            self.enemies.append(boss)
+        self.sound.play_music(MUSIC_KEY_BOSS)
+
     def _on_boss_defeated(self):
-        """Boss reward: a permanent, stacking speed buff + level 2 sky.
+        """Track the wave and advance only after every Boss is defeated.
 
         The speed buff stacks additively (see Player.effective_speed) and
         is completely independent from the timed power-ups — a player
@@ -1487,24 +1499,38 @@ class Game:
         totally separate places on Player (a float vs. a dict of timers).
         """
         self.player.permanent_speed_bonus += BOSS_PERMANENT_SPEED_BONUS
+        self._bosses_remaining -= 1
+        if self._bosses_remaining > 0:
+            return
+
+        self._boss_wave_active = False
         self.level += 1
-        self._advance_to_level_2()
+        self._next_boss_score = self.score + BOSS_SPAWN_SCORE_INTERVAL
+        self._set_level_palette()
         # Back to the calmer ambient track now that the fight is over —
         # same crossfade mechanism as switching TO the Boss theme.
         self.sound.play_music(MUSIC_KEY_LEVEL1)
 
-    def _advance_to_level_2(self):
-        """Swap the sky gradient to the level-2 palette.
+    def _set_level_palette(self):
+        """Update the sky gradient for the current level."""
+        if self.level == 1:
+            top, bottom = _ORIGINAL_COLOR_BG_TOP, _ORIGINAL_COLOR_BG_BOTTOM
+        elif self.level == 2:
+            top, bottom = LEVEL_2_COLOR_BG_TOP, LEVEL_2_COLOR_BG_BOTTOM
+        else:
+            hue = (0.75 + (self.level - 3) * 0.19) % 1.0
+            top = tuple(
+                round(channel * 255)
+                for channel in colorsys.hsv_to_rgb(hue, 0.85, 0.12)
+            )
+            bottom = tuple(
+                round(channel * 255)
+                for channel in colorsys.hsv_to_rgb(hue, 0.8, 0.22)
+            )
 
-        COLOR_BG_TOP / COLOR_BG_BOTTOM are read directly by
-        _draw_background() as module-level globals, so we reassign them
-        here with `global` rather than threading a "current palette"
-        value through the draw call — the smallest change that makes
-        the existing background code pick up the new colors automatically.
-        """
         global COLOR_BG_TOP, COLOR_BG_BOTTOM
-        COLOR_BG_TOP = LEVEL_2_COLOR_BG_TOP
-        COLOR_BG_BOTTOM = LEVEL_2_COLOR_BG_BOTTOM
+        COLOR_BG_TOP = top
+        COLOR_BG_BOTTOM = bottom
 
     # -----------------------------------------------------------------
     # Drawing
@@ -1698,7 +1724,7 @@ class Game:
             if now_ms < expiry
         ]
         for row, (kind, expiry) in enumerate(active):
-            remaining_s = (expiry - now_ms) / 1000.0
+            remaining_s = (expiry - now_ms) / 5000.0
             label = "DOUBLE SHOT" if kind == POWERUP_KIND_DOUBLE_SHOT else "RAPID FIRE"
             color = COLOR_POWERUP_DOUBLE_SHOT if kind == POWERUP_KIND_DOUBLE_SHOT else COLOR_POWERUP_RAPID_FIRE
             surf = self.font_small.render(f"{label}  {remaining_s:0.1f}s", True, color)
