@@ -246,10 +246,8 @@ SFX_PATHS = {
 SFX_VOLUME = 0.6
 
 MUSIC_KEY_LEVEL1 = "level1"
-MUSIC_KEY_BOSS = "boss"
 MUSIC_PATHS = {
-    MUSIC_KEY_LEVEL1: os.path.join(MUSIC_DIR, "level1_ambient.wav"),
-    MUSIC_KEY_BOSS:   os.path.join(MUSIC_DIR, "boss_battle.wav"),
+    MUSIC_KEY_LEVEL1: os.path.join(MUSIC_DIR, "level1_ambient.flac"),
 }
 MUSIC_VOLUME = 0.45
 MUSIC_CROSSFADE_MS = 900   # Fade-out old track / fade-in new track, each.
@@ -1356,6 +1354,7 @@ class Game:
             return
 
         if self.state != Game.STATE_PLAYING:
+            pygame.mixer.music.pause()
             return  # Pause and game-over freeze the world.
 
         now_ms = pygame.time.get_ticks()
@@ -1487,7 +1486,6 @@ class Game:
             boss.x = SCREEN_WIDTH * (index + 1) / (ENEMY_BOSSES_PER_WAVE + 1)
             boss.rect.center = (int(boss.x), int(boss.y))
             self.enemies.append(boss)
-        self.sound.play_music(MUSIC_KEY_BOSS)
 
     def _on_boss_defeated(self):
         """Track the wave and advance only after every Boss is defeated.
